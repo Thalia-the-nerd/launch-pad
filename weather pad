@@ -1,0 +1,337 @@
+#include <DS1307RTC.h>  // Include the DS1307 library
+#include <Wire.h>       // Include the Wire library for I2C communication
+#include <LiquidCrystal.h> // Include the LCD library
+#include <DHT.h>       // Include the DHT library
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_BMP280.h> // Include BMP280 library
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+//--- Sensor Pins ---
+#define DHTPIN 7        // DHT11/DHT22 data pin
+#define FlamePin 8       // Flame sensor digital pin
+#define SoundPin 9       // Sound sensor digital pin
+#define LaserPin 10      // Laser module digital pin
+#define TiltPin 11       // Tilt switch digital pin
+#define PhotoPin A0      // Photoresistor analog pin
+#define WaterLevelPin A1  // Water level sensor analog pin
+#define US_TRIGGER_PIN 12 // Ultrasonic trigger
+#define US_ECHO_PIN 13    // Ultrasonic echo
+#define TEMP_PROBE_PIN A2 //18B20 Data pin
+
+#define BMP280_CS 10    // CS pin for BMP280 (if using SPI)
+#define BMP280_SCK 13   // SCK pin for BMP280 (if using SPI)
+#define BMP280_MISO 12  // MISO pin for BMP280 (if using SPI)
+#define BMP280_MOSI 11  // MOSI pin for BMP280 (if using SPI)
+
+#define WindSpeedPin 2  // Anemometer pin (interrupt pin)
+#define RainPin 3       // Rain gauge pin (interrupt pin)
+#define SoilMoisturePin A3 // Soil moisture sensor analog pin
+#define UVPin A4          // UV sensor analog pin
+#define SD_CS_PIN 4      //SD card CS pin
+
+//--- Global Variables ---
+DHT dht(DHTPIN, DHT11); // DHT object
+LiquidCrystal lcd(2, 3, 5, 6, 7, 8); // LCD object
+RTC_DS1307 rtc;        // RTC object
+File dataFile;
+Adafruit_BMP280 bmp;    // BMP280 object
+OneWire oneWire(TEMP_PROBE_PIN);
+DallasTemperature sensors(&oneWire);
+
+//--- Global Variables for new sensors ---
+float windSpeed;
+float rainfall;
+unsigned long lastWindTime = 0;
+volatile unsigned int windCount = 0;
+unsigned long lastRainTime = 0;
+volatile unsigned int rainCount = 0;
+
+//--- Constants ---
+#define WindInterval 1000  // 1 second interval for wind speed measurement
+#define RainInterval 60000 // 1 minute interval for rainfall measurement
+const float RainPerTip = 0.2794; // mm of rain per tip of the rain gauge, this is for the SEN0202 rain gauge
+
+//--- Function declarations ---
+float readTemperatureProbe();
+float readUltrasonicDistance();
+void logData();
+String getLogHeader();
+
+void setup() {
+  //--- Initialize Serial Communication ---
+  Serial.begin(9600);
+
+  //--- Initialize I2C ---
+  Wire.begin();
+
+  //--- Initialize RTC ---
+  if (!rtc.begin()) {
+    Serial.println("RTC is NOT running!");
+    // Handle RTC error (e.g., stop, display error on LCD)
+  }
+  if (!rtc.isrunning()) {
+    rtc.adjust(DateTime(2024, 10, 26, 12, 0, 0)); // Set RTC date and time
+  }
+
+  //--- Initialize LCD ---
+  lcd.begin(16, 2);
+  lcd.print("Weather Station");
+
+  //--- Initialize DHT ---
+  dht.begin();
+
+  //--- Initialize BMP280 ---
+  if (!bmp.begin(BMP280_CS, BMP280_MOSI, BMP280_MISO, BMP280_SCK)) {  // Use SPI
+    Serial.println("Could not find a valid BMP280 sensor!");
+    lcd.clear();
+    lcd.print("BMP280 Error");
+    while (1);
+  }
+  bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
+                  Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
+                  Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
+                  Adafruit_BMP280::FILTER_X16,      /* Filtering. */
+                  Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
+
+  //--- Initialize Sensor Pins ---
+  pinMode(FlamePin, INPUT);
+  pinMode(SoundPin, INPUT);
+  pinMode(LaserPin, INPUT);
+  pinMode(TiltPin, INPUT_PULLUP);
+  pinMode(PhotoPin, INPUT);
+  pinMode(WaterLevelPin, INPUT);
+  pinMode(US_TRIGGER_PIN, OUTPUT);
+  pinMode(US_ECHO_PIN, INPUT);
+  pinMode(WindSpeedPin, INPUT_PULLUP);  // Enable internal pullup for anemometer
+  pinMode(RainPin, INPUT_PULLUP);       // Enable internal pullup for rain gauge
+  pinMode(SoilMoisturePin, INPUT);
+  pinMode(UVPin, INPUT);
+  //no pinMode for 18B20
+
+  //Initialize SD card
+  pinMode(SD_CS_PIN, OUTPUT);
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD card initialization failed!");
+    lcd.clear();
+    lcd.print("SD Init. Failed");
+    while (1);
+  }
+   //Initialize 18B20
+  sensors.begin();
+  //Print header
+  dataFile = SD.open("data.txt", FILE_WRITE);
+  if (dataFile) {
+    dataFile.println(getLogHeader());
+    dataFile.close();
+  } else {
+    Serial.println("Error opening data.txt");
+    lcd.clear();
+    lcd.print("SD Error");
+    while (1);
+  }
+  //--- Initialize Interrupts for Wind and Rain ---
+  attachInterrupt(digitalPinToInterrupt(WindSpeedPin), countWind, RISING);
+  attachInterrupt(digitalPinToInterrupt(RainPin), countRain, RISING);
+
+  // Initialise timers
+  lastWindTime = millis();
+  lastRainTime = millis();
+  delay(2000);
+  lcd.clear();
+}
+
+void loop() {
+  //--- Get Sensor Data ---
+  DateTime now = rtc.now();
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+  int flame = digitalRead(FlamePin);
+  int sound = digitalRead(SoundPin);
+  int laser = digitalRead(LaserPin);
+  int tilt = digitalRead(TiltPin);
+  int photo = analogRead(PhotoPin);
+  int waterLevel = analogRead(WaterLevelPin);
+  float ultrasonicDistance = readUltrasonicDistance();
+  float pressure = bmp.readPressure();
+  float uvLevel = analogRead(UVPin);  //  Analog reading
+  int soilMoisture = analogRead(SoilMoisturePin);
+  float probeTemp = readTemperatureProbe();
+
+  //--- Calculate Wind Speed ---
+  unsigned long currentTime = millis();
+  if (currentTime - lastWindTime >= WindInterval) {
+    windSpeed = (float)windCount / WindInterval * 2.4; // Calculate wind speed, adjust 2.4
+    windCount = 0;
+    lastWindTime = currentTime;
+  }
+
+  //--- Calculate Rainfall ---
+  if (currentTime - lastRainTime >= RainInterval) {
+    rainfall = rainCount * RainPerTip;
+    rainCount = 0;
+    lastRainTime = currentTime;
+  }
+
+  //--- Display Data on LCD ---
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("T:");
+  lcd.print(temperature);
+  lcd.print("C H:");
+  lcd.print(humidity);
+  lcd.setCursor(0, 1);
+  lcd.print("P:");
+  lcd.print(pressure / 100.0F); // Display pressure in hPa
+  lcd.print("hPa");
+
+  //--- Print Data to Serial Monitor ---
+  Serial.print(now.year(), DEC);
+  Serial.print('/');
+  Serial.print(now.month(), DEC);
+  Serial.print('/');
+  Serial.print(now.day(), DEC);
+  Serial.print(" ");
+  Serial.print(now.hour(), DEC);
+  Serial.print(':');
+  Serial.print(now.minute(), DEC);
+  Serial.print(':');
+  Serial.print(now.second(), DEC);
+  Serial.print(" Temp: ");
+  Serial.print(temperature);
+  Serial.print("C Hum: ");
+  Serial.print(humidity);
+  Serial.print(" Flame: ");
+  Serial.print(flame);
+  Serial.print(" Sound: ");
+  Serial.print(sound);
+  Serial.print(" Laser: ");
+  Serial.print(laser);
+  Serial.print(" Tilt: ");
+  Serial.print(tilt);
+  Serial.print(" Photo: ");
+  Serial.print(photo);
+  Serial.print(" Water: ");
+  Serial.print(waterLevel);
+  Serial.print(" Ultrasonic Distance: ");
+  Serial.print(ultrasonicDistance);
+  Serial.print("cm Pressure: ");
+  Serial.print(pressure);
+  Serial.print(" Pa Wind Speed: ");
+  Serial.print(windSpeed);
+  Serial.print(" m/s Rainfall: ");
+  Serial.print(rainfall);
+  Serial.print(" mm UV Level: ");
+  Serial.print(uvLevel);
+  Serial.print(" Soil Moisture: ");
+  Serial.print(soilMoisture);
+  Serial.print(" Probe Temp: ");
+  Serial.print(probeTemp);
+  Serial.println();
+
+  //--- Log data ---
+  logData();
+  delay(1000); // Delay for stability
+}
+
+float readTemperatureProbe() {
+  sensors.requestTemperatures();
+  return sensors.getTempCByIndex(0);
+}
+
+float readUltrasonicDistance() {
+  digitalWrite(US_TRIGGER_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(US_TRIGGER_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(US_TRIGGER_PIN, LOW);
+  long duration = pulseIn(US_ECHO_PIN, HIGH);
+  float distance = duration * 0.034 / 2; // Speed of sound in cm/µs and divide by 2 for one way
+  return distance;
+}
+
+void logData() {
+  DateTime now = rtc.now();
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+  int flame = digitalRead(FlamePin);
+  int sound = digitalRead(SoundPin);
+  int laser = digitalRead(LaserPin);
+  int tilt = digitalRead(TiltPin);
+  int photo = analogRead(PhotoPin);
+  int waterLevel = analogRead(WaterLevelPin);
+  float ultrasonicDistance = readUltrasonicDistance();
+  float pressure = bmp.readPressure();
+  float windSpeed = windSpeed;
+  float rainfall = rainfall;
+  float uvLevel = analogRead(UVPin);
+  int soilMoisture = analogRead(SoilMoisturePin);
+  float probeTemp = readTemperatureProbe();
+
+  dataFile = SD.open("data.txt", FILE_WRITE);
+  if (dataFile) {
+    dataFile.print(now.year(), DEC);
+    dataFile.print('/');
+    dataFile.print(now.month(), DEC);
+    dataFile.print('/');
+    dataFile.print(now.day(), DEC);
+    dataFile.print(',');
+    dataFile.print(now.hour(), DEC);
+    dataFile.print(':');
+    dataFile.print(now.minute(), DEC);
+    dataFile.print(':');
+    dataFile.print(now.second(), DEC);
+    dataFile.print(',');
+    dataFile.print(temperature);
+    dataFile.print(',');
+    dataFile.print(humidity);
+    dataFile.print(',');
+    dataFile.print(flame);
+    dataFile.print(',');
+    dataFile.print(sound);
+    dataFile.print(',');
+    dataFile.print(laser);
+    dataFile.print(',');
+    dataFile.print(tilt);
+    dataFile.print(',');
+    dataFile.print(photo);
+    dataFile.print(',');
+    dataFile.print(waterLevel);
+    dataFile.print(',');
+    dataFile.print(ultrasonicDistance);
+    dataFile.print(',');
+    dataFile.print(pressure);
+    dataFile.print(',');
+    dataFile.print(windSpeed);
+    dataFile.print(',');
+    dataFile.print(rainfall);
+    dataFile.print(',');
+    dataFile.print(uvLevel);
+    dataFile.print(',');
+    dataFile.print(soilMoisture);
+    dataFile.print(',');
+    dataFile.print(probeTemp);
+    dataFile.println();
+    dataFile.close();
+    Serial.println("Data logged to SD card");
+  } else {
+    Serial.println("Error opening data.txt");
+    lcd.clear();
+    lcd.print("SD Write Error");
+  }
+}
+
+String getLogHeader() {
+  String header = "Date,Time,Temperature(C),Humidity(%),Flame,Sound,Laser,Tilt,Light,WaterLevel,Distance(cm),Pressure(Pa),WindSpeed(m/s),Rainfall(mm),UVLevel,SoilMoisture,ProbeTemp(C)";
+  return header;
+}
+
+//--- Interrupt Routines ---
+void countWind() {
+  windCount++;
+}
+
+void countRain() {
+  rainCount++;
+}
